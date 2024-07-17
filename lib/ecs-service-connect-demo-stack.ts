@@ -35,67 +35,103 @@ export class EcsServiceConnectDemoStack extends cdk.Stack {
       retention: RetentionDays.ONE_WEEK
     })
 
-    const { taskdef: yelbUiTaskDefinition,
-      container: yelbUiContainer
-    } = this.buildTaskDefinition("yelb-ui", "mreferre/yelb-ui:0.10", dnsNamespace);
+    const uiPorts = [{ portMappingName: "yelb-ui", port: 80 }]
 
-    yelbUiContainer.addPortMappings({
-      containerPort: 80
-    });
+    const yelbUiTaskDefinition = this.buildTaskDefinition("yelb-ui", "mreferre/yelb-ui:0.10", uiPorts);
 
     const yelbuiservice = new ecs_patterns.ApplicationLoadBalancedFargateService(this, "yelb-ui-service", {
-      cluster: ecsCluster, // Required
-      desiredCount: 3, // Default is 1
-      publicLoadBalancer: true, // Default is false
+      cluster: ecsCluster, 
+      desiredCount: 2, 
+      publicLoadBalancer: true, 
       serviceName: "yelb-ui",
       taskDefinition: yelbUiTaskDefinition,
-      cloudMapOptions: { name: "yelb-ui", cloudMapNamespace: dnsNamespace },
       enableExecuteCommand: true
     });
 
-    const { taskdef: yelbAppServerTaskDefinition } = this.buildTaskDefinition("yelb-appserver", "mreferre/yelb-appserver:0.7", dnsNamespace);
+    // Have to do this separate because ApplicationLoadBalancedFargateService doesn't support service connect
+    yelbuiservice.service.enableServiceConnect({
+      namespace: dnsNamespace.namespaceName,
+    })
+
+    yelbuiservice.node.addDependency(dnsNamespace)
+
+    const appPorts = [{ portMappingName: "yelb-appserver", port: 4567 }]
+
+    const yelbAppServerTaskDefinition = this.buildTaskDefinition("yelb-appserver", "mreferre/yelb-appserver:0.7", appPorts);
 
     const yelbappserverservice = new ecs.FargateService(this, "yelb-appserver-service", {
-      cluster: ecsCluster, // Required
-      desiredCount: 2, // Default is 1
+      cluster: ecsCluster, 
+      desiredCount: 2, 
       serviceName: "yelb-appserver",
       taskDefinition: yelbAppServerTaskDefinition,
-      cloudMapOptions: { name: "yelb-appserver", cloudMapNamespace: dnsNamespace },
+      serviceConnectConfiguration: {
+        services: appPorts.map(({ portMappingName, port }) => ({
+          portMappingName,
+          dnsName: portMappingName,
+          port,
+        })),
+        namespace: dnsNamespace.namespaceName,
+      },
       enableExecuteCommand: true
     });
 
     yelbappserverservice.connections.allowFrom(yelbuiservice.service, ec2.Port.tcp(4567))
+
+    yelbappserverservice.node.addDependency(dnsNamespace)
+
+    const dbPorts = [{ portMappingName: "yelb-db", port: 5432 }]
     
-    const { taskdef: yelbDbTaskDefinition } = this.buildTaskDefinition("yelb-db", "mreferre/yelb-db:0.6", dnsNamespace);
+    const yelbDbTaskDefinition = this.buildTaskDefinition("yelb-db", "mreferre/yelb-db:0.6", dbPorts);
 
     const yelbdbservice = new ecs.FargateService(this, "yelb-db-service", {
-      cluster: ecsCluster, // Required
+      cluster: ecsCluster,
       serviceName: "yelb-db",
       taskDefinition: yelbDbTaskDefinition,
-      cloudMapOptions: { name: "yelb-db", cloudMapNamespace: dnsNamespace },
+      // Comment this out if you wish to experiment setting this up manually through the AWS Console
+      serviceConnectConfiguration: {
+        services: dbPorts.map(({ portMappingName, port }) => ({
+          portMappingName,
+          dnsName: portMappingName,
+          port,
+        })),
+        namespace: dnsNamespace.namespaceName,
+      },
       enableExecuteCommand: true
     });
 
     yelbdbservice.connections.allowFrom(yelbappserverservice, ec2.Port.tcp(5432))
 
-    const { taskdef: redisTaskDefinition } = this.buildTaskDefinition("redis", "redis:4.0.2", dnsNamespace);
+    yelbdbservice.node.addDependency(dnsNamespace)
+
+    const redisPorts = [{ portMappingName: "redis-server", port: 6379 }]
+
+    const redisTaskDefinition = this.buildTaskDefinition("redis", "redis:4.0.2", redisPorts);
 
     const redisserverservice = new ecs.FargateService(this, "redis-server-service", {
-      cluster: ecsCluster, // Required
+      cluster: ecsCluster, 
       serviceName: "redis-server",
       taskDefinition: redisTaskDefinition,
-      cloudMapOptions: { name: "redis-server", cloudMapNamespace: dnsNamespace },
+      serviceConnectConfiguration: {
+        services: redisPorts.map(({ portMappingName, port }) => ({
+          portMappingName,
+          dnsName: portMappingName,
+          port,
+        })),
+        namespace: dnsNamespace.namespaceName,
+      },
       enableExecuteCommand: true
     });
 
     redisserverservice.connections.allowFrom(yelbappserverservice, ec2.Port.tcp(6379))
+
+    redisserverservice.node.addDependency(dnsNamespace)
   }
 
-  buildTaskDefinition = (appName: string, dockerImage: string, dnsNamespace: servicediscovery.PrivateDnsNamespace) => {
+  buildTaskDefinition = (appName: string, dockerImage: string, portMappings: { portMappingName: string, port: number }[]) => {
 
     const taskdef = new ecs.FargateTaskDefinition(this, `${appName}-taskdef`, {
-      memoryLimitMiB: 2048, // Default is 512
-      cpu: 512, // Default is 256
+      memoryLimitMiB: 2048, 
+      cpu: 512, 
     });
 
     const container = taskdef.addContainer(`${appName}`, {
@@ -103,10 +139,15 @@ export class EcsServiceConnectDemoStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({ 
         logGroup: this.logGroup,
         streamPrefix: `service`
-      }),
-      environment: { "SEARCH_DOMAIN": dnsNamespace.namespaceName },
+      })
     })
 
-    return { taskdef, container };
+    portMappings.forEach(({ port, portMappingName }) =>
+      container.addPortMappings({ containerPort: port, name: portMappingName})
+    );
+
+    taskdef.executionRole?.addManagedPolicy(cdk.aws_iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AmazonECSTaskExecutionRolePolicy"))
+
+    return taskdef
   }
 }
