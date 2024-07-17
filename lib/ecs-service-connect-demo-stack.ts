@@ -87,7 +87,9 @@ export class EcsServiceConnectDemoStack extends cdk.Stack {
       cluster: ecsCluster,
       serviceName: "yelb-db",
       taskDefinition: yelbDbTaskDefinition,
-      // Comment this out if you wish to experiment setting this up manually through the AWS Console
+      // Comment the "serviceConnectConfiguration" block out if you wish to experiment setting this up manually through the AWS Console
+      // If manually setting up, make sure you disable Service Connect log configuration (under advanced) 
+      // as the generated execution role doesn't have permission to create log groups, so the deployment will get stuck in a crash loop
       serviceConnectConfiguration: {
         services: dbPorts.map(({ portMappingName, port }) => ({
           portMappingName,
